@@ -20,6 +20,8 @@
 package control
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"sync"
@@ -56,6 +58,108 @@ func idstring(err error, entries ...fmt.Stringer) string {
 		filler = " "
 	}
 	return retval
+}
+
+//-----------------------------------------------------------------------------
+//
+//-----------------------------------------------------------------------------
+
+const restSubscriptionResponsePath = "/ric/v1/subscriptions/response"
+
+func restTargetFromClientEndpoint(clientEndpoint *models.SubscriptionParamsClientEndpoint) string {
+	if clientEndpoint == nil {
+		return "unknown"
+	}
+	if clientEndpoint.HTTPPort != nil && *clientEndpoint.HTTPPort > 0 {
+		return fmt.Sprintf("%s:%d", clientEndpoint.Host, *clientEndpoint.HTTPPort)
+	}
+	if clientEndpoint.Host != "" {
+		return clientEndpoint.Host
+	}
+	return "unknown"
+}
+
+func restTargetFromSubscription(restSubscription *RESTSubscription) string {
+	if restSubscription == nil {
+		return "unknown"
+	}
+	if restSubscription.xAppRmrEndPoint != "" {
+		return restSubscription.xAppRmrEndPoint
+	}
+	if restSubscription.xAppServiceName != "" {
+		return restSubscription.xAppServiceName
+	}
+	return "unknown"
+}
+
+func logRestSubscriptionResult(action string, restSubId string, target string, statusCode int, err error) {
+	if restSubId == "" {
+		restSubId = "unknown"
+	}
+	if target == "" {
+		target = "unknown"
+	}
+	if statusCode >= http.StatusBadRequest {
+		xapp.Logger.Error("REST subscription %s failed: subId=%s target=%s status=%d err=%v", action, restSubId, target, statusCode, err)
+		return
+	}
+	if err != nil {
+		xapp.Logger.Warn("REST subscription %s: subId=%s target=%s status=%d err=%v", action, restSubId, target, statusCode, err)
+		return
+	}
+	xapp.Logger.Info("REST subscription %s: subId=%s target=%s status=%d", action, restSubId, target, statusCode)
+}
+
+func logRestCallbackFailure(restSubId string, target string, statusCode int, err error) {
+	if restSubId == "" {
+		restSubId = "unknown"
+	}
+	if target == "" {
+		target = "unknown"
+	}
+	if err == nil {
+		err = fmt.Errorf("unexpected status %d", statusCode)
+	}
+	xapp.Logger.Error("REST callback failed: subId=%s target=%s status=%d err=%v", restSubId, target, statusCode, err)
+}
+
+func notifyRESTSubscription(resp *models.SubscriptionResponse, clientEndpoint *models.SubscriptionParamsClientEndpoint) (int, error) {
+	if clientEndpoint == nil || clientEndpoint.HTTPPort == nil {
+		return 0, fmt.Errorf("client endpoint is missing")
+	}
+	respData, err := json.Marshal(resp)
+	if err != nil {
+		return 0, err
+	}
+	clientUrl := fmt.Sprintf("http://%s:%d%s", clientEndpoint.Host, *clientEndpoint.HTTPPort, restSubscriptionResponsePath)
+	retries := viper.GetInt("subscription.retryCount")
+	if retries == 0 {
+		retries = 10
+	}
+	delay := viper.GetInt("subscription.retryDelay")
+	if delay == 0 {
+		delay = 5
+	}
+	var statusCode int
+	for i := 0; i < retries; i++ {
+		resp, postErr := http.Post(clientUrl, "application/json", bytes.NewBuffer(respData))
+		if resp != nil {
+			statusCode = resp.StatusCode
+			if resp.Body != nil {
+				resp.Body.Close()
+			}
+		}
+		if postErr == nil && statusCode == http.StatusOK {
+			return statusCode, nil
+		}
+		if postErr != nil {
+			err = postErr
+		} else if statusCode != 0 && statusCode != http.StatusOK {
+			err = fmt.Errorf("unexpected status %d", statusCode)
+		}
+		time.Sleep(time.Duration(delay) * time.Second)
+	}
+	return statusCode, err
 }
 
 //-----------------------------------------------------------------------------
@@ -451,6 +555,15 @@ func (c *Control) RESTSubscriptionHandler(params interface{}) (*models.Subscript
 
 	subResp := models.SubscriptionResponse{}
 	p := params.(*models.SubscriptionParams)
+	restSubId := ""
+	target := restTargetFromClientEndpoint(p.ClientEndpoint)
+	statusCode := 0
+	var logErr error
+	defer func() {
+		if statusCode != 0 {
+			logRestSubscriptionResult("create", restSubId, target, statusCode, logErr)
+		}
+	}()
 
 	if c.LoggerLevel > 2 {
 		c.PrintRESTSubscriptionRequest(p)
@@ -458,32 +571,44 @@ func (c *Control) RESTSubscriptionHandler(params interface{}) (*models.Subscript
 
 	if c.e2IfState.IsE2ConnectionUp(p.Meid) == false || c.e2IfState.IsE2ConnectionUnderReset(p.Meid) == true {
 		if c.e2IfState.IsE2ConnectionUp(p.Meid) == false {
+			logErr = fmt.Errorf("No E2 connection for ranName %v", *p.Meid)
 			xapp.Logger.Error("No E2 connection for ranName %v", *p.Meid)
 		} else if c.e2IfState.IsE2ConnectionUnderReset(p.Meid) == true {
+			logErr = fmt.Errorf("E2 Node for ranName %v UNDER RESET", *p.Meid)
 			xapp.Logger.Error("E2 Node for ranName %v UNDER RESET", *p.Meid)
 		}
 		c.UpdateCounter(cRestReqRejDueE2Down)
-		return nil, common.SubscribeServiceUnavailableCode
+		statusCode = common.SubscribeServiceUnavailableCode
+		return nil, statusCode
 	}
 
 	if p.ClientEndpoint == nil {
 		err := fmt.Errorf("ClientEndpoint == nil")
 		xapp.Logger.Error("%v", err)
 		c.UpdateCounter(cRestSubFailToXapp)
-		return nil, common.SubscribeBadRequestCode
+		logErr = err
+		statusCode = common.SubscribeBadRequestCode
+		return nil, statusCode
 	}
 
 	e2SubscriptionDirectives, err := c.GetE2SubscriptionDirectives(p)
 	if err != nil {
 		xapp.Logger.Error("%s", err)
 		c.UpdateCounter(cRestSubFailToXapp)
-		return nil, common.SubscribeBadRequestCode
+		logErr = err
+		statusCode = common.SubscribeBadRequestCode
+		return nil, statusCode
 	}
-	_, xAppRmrEndpoint, err := ConstructEndpointAddresses(*p.ClientEndpoint)
+	xAppHTTPEndPoint, xAppRmrEndpoint, err := ConstructEndpointAddresses(*p.ClientEndpoint)
 	if err != nil {
 		xapp.Logger.Error("%s", err.Error())
 		c.UpdateCounter(cRestSubFailToXapp)
-		return nil, common.SubscribeBadRequestCode
+		logErr = err
+		statusCode = common.SubscribeBadRequestCode
+		return nil, statusCode
+	}
+	if xAppHTTPEndPoint != "" {
+		target = xAppHTTPEndPoint
 	}
 
 	md5sum, err := CalculateRequestMd5sum(params)
@@ -494,7 +619,9 @@ func (c *Control) RESTSubscriptionHandler(params interface{}) (*models.Subscript
 	restSubscription, restSubId, err := c.GetOrCreateRestSubscription(p, md5sum, xAppRmrEndpoint, p.ClientEndpoint.Host)
 	if err != nil {
 		xapp.Logger.Error("Subscription with id in REST request does not exist")
-		return nil, common.SubscribeNotFoundCode
+		logErr = err
+		statusCode = common.SubscribeNotFoundCode
+		return nil, statusCode
 	}
 
 	subResp.SubscriptionID = &restSubId
@@ -505,7 +632,9 @@ func (c *Control) RESTSubscriptionHandler(params interface{}) (*models.Subscript
 		c.restDuplicateCtrl.DeleteLastKnownRestSubsIdBasedOnMd5sum(md5sum)
 		c.registry.DeleteRESTSubscription(&restSubId)
 		c.UpdateCounter(cRestSubFailToXapp)
-		return nil, common.SubscribeBadRequestCode
+		logErr = err
+		statusCode = common.SubscribeBadRequestCode
+		return nil, statusCode
 	}
 
 	duplicate := c.restDuplicateCtrl.IsDuplicateToOngoingTransaction(restSubId, md5sum)
@@ -514,14 +643,16 @@ func (c *Control) RESTSubscriptionHandler(params interface{}) (*models.Subscript
 		xapp.Logger.Debug("%s", err)
 		c.registry.DeleteRESTSubscription(&restSubId)
 		c.UpdateCounter(cRestSubRespToXapp)
-		return &subResp, common.SubscribeCreatedCode
+		statusCode = common.SubscribeCreatedCode
+		return &subResp, statusCode
 	}
 
 	c.WriteRESTSubscriptionToDb(restSubId, restSubscription)
 	go c.processSubscriptionRequests(restSubscription, &subReqList, p.ClientEndpoint, p.Meid, &restSubId, xAppRmrEndpoint, md5sum, e2SubscriptionDirectives)
 
 	c.UpdateCounter(cRestSubRespToXapp)
-	return &subResp, common.SubscribeCreatedCode
+	statusCode = common.SubscribeCreatedCode
+	return &subResp, statusCode
 }
 
 //-------------------------------------------------------------------
@@ -739,9 +870,9 @@ func (c *Control) sendUnsuccesfullResponseNotification(restSubId *string, restSu
 	}
 
 	c.UpdateCounter(cRestSubFailNotifToXapp)
-	err = xapp.Subscription.Notify(resp, *clientEndpoint)
-	if err != nil {
-		xapp.Logger.Error("xapp.Subscription.Notify failed %s", err.Error())
+	statusCode, notifyErr := notifyRESTSubscription(resp, clientEndpoint)
+	if notifyErr != nil || statusCode != http.StatusOK {
+		logRestCallbackFailure(*restSubId, restTargetFromClientEndpoint(clientEndpoint), statusCode, notifyErr)
 	}
 
 	// E2 is down. Delete completely processed request safely now
@@ -777,9 +908,9 @@ func (c *Control) sendSuccesfullResponseNotification(restSubId *string, restSubs
 	xapp.Logger.Debug("Sending successful REST notification: ErrorCause:%s, ErrorSource:%s, TimeoutType:%s, to Endpoint=%v:%v, XappEventInstanceID=%v, E2EventInstanceID=%v, %s",
 		errorInfo.ErrorCause, errorInfo.ErrorSource, errorInfo.TimeoutType, clientEndpoint.Host, *clientEndpoint.HTTPPort, xAppEventInstanceID, e2EventInstanceID, idstring(nil, trans))
 	c.UpdateCounter(cRestSubNotifToXapp)
-	err := xapp.Subscription.Notify(resp, *clientEndpoint)
-	if err != nil {
-		xapp.Logger.Error("xapp.Subscription.Notify failed %s", err.Error())
+	statusCode, notifyErr := notifyRESTSubscription(resp, clientEndpoint)
+	if notifyErr != nil || statusCode != http.StatusOK {
+		logRestCallbackFailure(*restSubId, restTargetFromClientEndpoint(clientEndpoint), statusCode, notifyErr)
 	}
 
 	// E2 is down. Delete completely processed request safely now
@@ -797,29 +928,44 @@ func (c *Control) RESTSubscriptionDeleteHandler(restSubId string) int {
 	c.CntRecvMsg++
 	c.UpdateCounter(cRestSubDelReqFromXapp)
 
+	statusCode := 0
+	target := ""
+	var logErr error
+	defer func() {
+		if statusCode != 0 {
+			logRestSubscriptionResult("delete", restSubId, target, statusCode, logErr)
+		}
+	}()
+
 	xapp.Logger.Debug("SubscriptionDeleteRequest from XAPP")
 
 	restSubscription, err := c.registry.GetRESTSubscription(restSubId, true)
 	if err != nil {
 		xapp.Logger.Error("%s", err.Error())
+		logErr = err
 		if restSubscription == nil {
 			// Subscription was not found
 			c.UpdateCounter(cRestSubDelRespToXapp)
-			return common.UnsubscribeNoContentCode
+			statusCode = common.UnsubscribeNoContentCode
+			return statusCode
 		} else {
 			if restSubscription.SubReqOngoing == true {
 				err := fmt.Errorf("Handling of the REST Subscription Request still ongoing %s", restSubId)
+				logErr = err
 				xapp.Logger.Error("%s", err.Error())
 				c.UpdateCounter(cRestSubDelFailToXapp)
-				return common.UnsubscribeBadRequestCode
+				statusCode = common.UnsubscribeBadRequestCode
+				return statusCode
 			} else if restSubscription.SubDelReqOngoing == true {
 				// Previous request for same restSubId still ongoing
 				c.UpdateCounter(cRestSubDelRespToXapp)
-				return common.UnsubscribeNoContentCode
+				statusCode = common.UnsubscribeNoContentCode
+				return statusCode
 			}
 		}
 	}
 
+	target = restTargetFromSubscription(restSubscription)
 	xAppRmrEndPoint := restSubscription.xAppRmrEndPoint
 	go func() {
 		xapp.Logger.Debug("Deleteting handler: processing instances = %v", restSubscription.InstanceIds)
@@ -839,7 +985,8 @@ func (c *Control) RESTSubscriptionDeleteHandler(restSubId string) int {
 	}()
 
 	c.UpdateCounter(cRestSubDelRespToXapp)
-	return common.UnsubscribeNoContentCode
+	statusCode = common.UnsubscribeNoContentCode
+	return statusCode
 }
 
 //-------------------------------------------------------------------
